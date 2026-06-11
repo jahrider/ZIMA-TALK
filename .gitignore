@@ -11,3 +11,5 @@ webhook.pem
 webhook.key
 google_token.json
 google_credentials.json
+owner.json
+prompt.txt
