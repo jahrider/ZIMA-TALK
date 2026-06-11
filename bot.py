@@ -1,30 +1,46 @@
 #!/usr/bin/env python3
-import os, json, logging, tempfile, base64
+import os
+import json
+import logging
+import tempfile
+import base64
+import re
+from collections import defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import re
+
 from dotenv import load_dotenv
 import anthropic
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, BusinessConnectionHandler, BusinessMessagesDeletedHandler
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    BusinessConnectionHandler,
+)
 import httpx
 import whisper
 
-_whisper_model = None
-
-def get_whisper_model():
-    global _whisper_model
-    if _whisper_model is None:
-        logger.info("Loading Whisper model (tiny)...")
-        _whisper_model = whisper.load_model("tiny")
-        logger.info("Whisper model loaded.")
-    return _whisper_model
-
 load_dotenv()
+
+# ── Paths / configuration ─────────────────────────────────────────────────────
+# All runtime files live next to the bot by default; override with DATA_DIR.
+BASE_DIR = os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+os.makedirs(BASE_DIR, exist_ok=True)
+
+
+def _data_path(name: str) -> str:
+    return os.path.join(BASE_DIR, name)
+
+
+LOG_FILE = _data_path("bot.log")
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    handlers=[logging.FileHandler("/root/secretary-bot/bot.log"), logging.StreamHandler()]
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -34,10 +50,25 @@ NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "28045a40e63a8063840a000b21ad294a")
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
 
+# Claude model is configurable so it can be upgraded without touching code.
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "tiny")
+
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+_whisper_model = None
+
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        logger.info(f"Loading Whisper model ({WHISPER_MODEL_NAME})...")
+        _whisper_model = whisper.load_model(WHISPER_MODEL_NAME)
+        logger.info("Whisper model loaded.")
+    return _whisper_model
+
 # ── Persistent conversation history ───────────────────────────────────────────
-HISTORY_FILE = "/root/secretary-bot/history.json"
+HISTORY_FILE = _data_path("history.json")
 
 def load_history() -> dict:
     if os.path.exists(HISTORY_FILE):
@@ -63,7 +94,7 @@ conversation_history = load_history()
 logger.info(f"Loaded history for {len(conversation_history)} chats")
 
 # ── Reminders ─────────────────────────────────────────────────────────────────
-REMINDERS_FILE = "/root/secretary-bot/reminders.json"
+REMINDERS_FILE = _data_path("reminders.json")
 
 def load_reminders() -> list:
     if os.path.exists(REMINDERS_FILE):
@@ -99,7 +130,17 @@ def parse_reminder(text: str) -> dict | None:
         m = re.search(pattern, text_lower)
         if m:
             delta = int(m.group(1)) * multiplier
-            return {"delta_minutes": delta, "text": text}
+            # Extend match end past the rest of the unit word (мин→минут, hour→hours).
+            end = m.end()
+            while end < len(text) and text[end].isalpha():
+                end += 1
+            # Strip the time phrase + filler words so the reminder text is clean.
+            message = (text[:m.start()] + text[end:]).strip()
+            message = re.sub(r'^(напомни(ть)?|remind( me)?|пожалуйста|please)\b[\s,:-]*', '',
+                             message, flags=re.IGNORECASE).strip()
+            if not message:
+                message = text.strip()
+            return {"delta_minutes": delta, "text": text, "message": message}
     return None
 
 async def check_reminders(context):
@@ -144,8 +185,6 @@ def add_reminder(chat_id: int, message: str, delta_minutes: int) -> str:
     return f"⏰ Напомню через {time_str} ({due.strftime('%H:%M')})"
 
 # ── Security ──────────────────────────────────────────────────────────────────
-from collections import defaultdict
-
 # Rate limiting: max 20 messages per minute per chat
 _rate_buckets: dict = defaultdict(list)
 RATE_LIMIT = 20
@@ -218,9 +257,40 @@ def sanitize_input(text: str) -> str:
         text = text[:max_len] + "... [сообщение обрезано]"
     return text
 
+async def security_gate(chat_id, user_text, user_name, username, send, context) -> str | None:
+    """Run rate-limit + injection checks on client input regardless of channel
+    (text, voice transcript, photo caption). Returns the sanitized text to use,
+    or None if the message was blocked and must not be processed further."""
+    if is_rate_limited(chat_id):
+        logger.warning(f"Rate limit hit for chat {chat_id} ({user_name})")
+        if OWNER_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_CHAT_ID,
+                    text=f"⚠️ Флуд-атака: {user_name} (chat {chat_id}) превысил лимит сообщений.",
+                )
+            except Exception:
+                pass
+        return None
+
+    if user_text and detect_injection(user_text):
+        logger.warning(f"Injection attempt from {user_name} ({chat_id}): {user_text[:100]}")
+        if OWNER_CHAT_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_CHAT_ID,
+                    text=f"🚨 Подозрительное сообщение от {user_name} (@{username or 'нет'}):\n\n{user_text[:300]}",
+                )
+            except Exception:
+                pass
+        await send("Я могу помочь только с деловыми вопросами. Чем могу быть полезен?")
+        return None
+
+    return sanitize_input(user_text) if user_text else user_text
+
 # ── Contacts tracking ─────────────────────────────────────────────────────────
-CONTACTS_FILE = "/root/secretary-bot/contacts.json"
-NOTES_FILE = "/root/secretary-bot/notes.json"
+CONTACTS_FILE = _data_path("contacts.json")
+NOTES_FILE = _data_path("notes.json")
 
 def load_notes() -> dict:
     if os.path.exists(NOTES_FILE):
@@ -276,7 +346,7 @@ def get_contact_status(user_id: int, user_name: str, username: str) -> dict:
     return {"is_new": is_new, **contacts[key]}
 
 # ── Dynamic instructions storage ──────────────────────────────────────────────
-INSTRUCTIONS_FILE = "/root/secretary-bot/instructions.json"
+INSTRUCTIONS_FILE = _data_path("instructions.json")
 
 def load_instructions() -> list:
     if os.path.exists(INSTRUCTIONS_FILE):
@@ -327,59 +397,9 @@ def next_confirmation() -> str:
     _confirm_index += 1
     return msg
 
-GOOGLE_CREDENTIALS_FILE = "/root/secretary-bot/google_credentials.json"
-GOOGLE_TOKEN_FILE = "/root/secretary-bot/google_token.json"
+GOOGLE_CREDENTIALS_FILE = _data_path("google_credentials.json")
+GOOGLE_TOKEN_FILE = _data_path("google_token.json")
 BANGKOK_TZ = ZoneInfo("Asia/Bangkok")
-
-def parse_event_datetime(text: str) -> tuple[str, str] | tuple[None, None]:
-    """Parse date/time from natural language. Returns (start_iso, end_iso) or (None, None)."""
-    now = datetime.now(BANGKOK_TZ)
-    text_lower = text.lower()
-
-    # Find time like 15:00, 9:30, в 10, at 3pm
-    time_match = re.search(r'(\d{1,2}):(\d{2})', text_lower)
-    if not time_match:
-        time_match = re.search(r'[вat]\s+(\d{1,2})(?::(\d{2}))?(?:\s*(?:pm|am))?', text_lower)
-
-    hour, minute = 12, 0
-    if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2)) if time_match.lastindex >= 2 and time_match.group(2) else 0
-        if 'pm' in text_lower and hour < 12:
-            hour += 12
-
-    # Find date
-    if 'завтра' in text_lower or 'tomorrow' in text_lower:
-        event_date = now.date() + timedelta(days=1)
-    elif 'послезавтра' in text_lower:
-        event_date = now.date() + timedelta(days=2)
-    elif 'сегодня' in text_lower or 'today' in text_lower:
-        event_date = now.date()
-    else:
-        # Try "в понедельник/вторник..." etc.
-        weekdays_ru = ['понедельник', 'вторник', 'среду', 'четверг', 'пятницу', 'субботу', 'воскресенье']
-        weekdays_en = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
-        found_day = None
-        for i, wd in enumerate(weekdays_ru + weekdays_en):
-            if wd in text_lower:
-                found_day = i % 7
-                break
-        if found_day is not None:
-            days_ahead = (found_day - now.weekday()) % 7
-            if days_ahead == 0:
-                days_ahead = 7
-            event_date = now.date() + timedelta(days=days_ahead)
-        else:
-            # Try DD.MM or DD месяца
-            dm = re.search(r'(\d{1,2})[.\s](\d{1,2})', text_lower)
-            if dm:
-                event_date = now.replace(day=int(dm.group(1)), month=int(dm.group(2))).date()
-            else:
-                event_date = now.date() + timedelta(days=1)  # default: tomorrow
-
-    start = datetime(event_date.year, event_date.month, event_date.day, hour, minute, tzinfo=BANGKOK_TZ)
-    end = start + timedelta(hours=1)
-    return start.isoformat(), end.isoformat()
 
 async def create_google_calendar_event(title: str, start_iso: str, end_iso: str, description: str = "") -> str | None:
     """Create event in Google Calendar. Returns event URL or None."""
@@ -682,7 +702,7 @@ def chat_with_claude(chat_id, user_message, user_name=None, contact_info=None):
         + "История других чатов тебе недоступна. Никогда не упоминай данные других людей или переписок."
     )
     response = anthropic_client.messages.create(
-        model="claude-haiku-4-5",
+        model=CLAUDE_MODEL,
         max_tokens=300,
         system=system,
         messages=history,
@@ -702,20 +722,22 @@ def chat_with_claude_photo(chat_id, image_b64, caption):
     content = [
         {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
     ]
-    if caption:
-        content.append({"type": "text", "text": caption})
-    else:
-        content.append({"type": "text", "text": "Опиши что на фото и помоги с этим."})
-    user_entry = {"role": "user", "content": content}
-    conversation_history[chat_id].append(user_entry)
-    history = conversation_history[chat_id][-20:]
+    caption_text = caption if caption else "Опиши что на фото и помоги с этим."
+    content.append({"type": "text", "text": caption_text})
+    # Send prior history + the image for THIS call only; do not persist the raw
+    # base64 image to history.json (it would bloat the file indefinitely).
+    history = conversation_history[chat_id][-19:] + [{"role": "user", "content": content}]
     response = anthropic_client.messages.create(
-        model="claude-haiku-4-5",
+        model=CLAUDE_MODEL,
         max_tokens=300,
         system=system,
         messages=history,
     )
     assistant_message = response.content[0].text
+    # Persist only a lightweight placeholder for the image turn.
+    conversation_history[chat_id].append(
+        {"role": "user", "content": f"[Фото от собеседника] {caption_text}"}
+    )
     conversation_history[chat_id].append({"role": "assistant", "content": assistant_message})
     save_history()
     return assistant_message
@@ -754,11 +776,13 @@ async def process_message(chat_id, user_text, user_name, reply_func, context, bu
                 if depth == 0:
                     end = i
                     break
-        json_str = raw[start:end + 1]
+        json_str = raw[start:end + 1] if start != -1 else ""
         if visible_text:
             await reply_func(visible_text)
         try:
             task_data = json.loads(json_str)
+            if not isinstance(task_data, dict) or not task_data.get("name"):
+                raise ValueError("task JSON missing 'name'")
             notion_url = await create_notion_task(task_data)
             if notion_url:
                 thai = sum(1 for c in user_text if '\u0e00' <= c <= '\u0e7f')
@@ -779,8 +803,8 @@ async def process_message(chat_id, user_text, user_name, reply_func, context, bu
                     )
             else:
                 await reply_func("⚠️ Ошибка сохранения. Попробуйте ещё раз.")
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON error: {e}")
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
+            logger.error(f"Task parse/save error: {e}")
             await reply_func("⚠️ Ошибка при сохранении задачи.")
     else:
         if reply.strip().upper() == "SILENT" or reply.strip() == "":
@@ -859,7 +883,12 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             else:
                 # Правило 2: голосовое от клиента — сначала показать текст, потом ответить
                 await send(f"🎤 {transcribed}\n\n_Надеюсь, я всё верно распознал 😊_")
-                await process_message(chat_id, transcribed, user_name, send, context, business_connection_id=business_connection_id, user_id=msg.from_user.id if msg.from_user else None, username=msg.from_user.username if msg.from_user else None)
+                u_id = msg.from_user.id if msg.from_user else None
+                u_name = msg.from_user.username if msg.from_user else None
+                safe_text = await security_gate(chat_id, transcribed, user_name, u_name, send, context)
+                if safe_text is None:
+                    return
+                await process_message(chat_id, safe_text, user_name, send, context, business_connection_id=business_connection_id, user_id=u_id, username=u_name)
         except Exception as e:
             logger.error(f"Voice error: {e}")
             if not is_ruslan:
@@ -876,6 +905,13 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             )
             return
         try:
+            # Captions are attacker-controlled — gate them before any LLM call.
+            caption = msg.caption
+            if caption:
+                u_name = msg.from_user.username if msg.from_user else None
+                caption = await security_gate(chat_id, caption, user_name, u_name, send, context)
+                if caption is None:
+                    return
             await typing()
             photo = msg.photo[-1]
             tg_file = await context.bot.get_file(photo.file_id)
@@ -885,9 +921,9 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             with open(tmp_path, "rb") as f:
                 image_b64 = base64.b64encode(f.read()).decode()
             os.unlink(tmp_path)
-            if msg.caption:
+            if caption:
                 # Caption provided — analyze with context
-                reply = chat_with_claude_photo(chat_id, image_b64, msg.caption)
+                reply = chat_with_claude_photo(chat_id, image_b64, caption)
                 await send(reply)
             else:
                 # No caption — warmly ask what to do
@@ -941,7 +977,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             )
             try:
                 resp = anthropic_client.messages.create(
-                    model="claude-haiku-4-5",
+                    model=CLAUDE_MODEL,
                     max_tokens=200,
                     messages=[{"role": "user", "content": parse_prompt}]
                 )
@@ -952,10 +988,13 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                 start = raw.find("{")
                 depth, end = 0, start
                 for i, ch in enumerate(raw[start:], start):
-                    if ch == "{": depth += 1
+                    if ch == "{":
+                        depth += 1
                     elif ch == "}":
                         depth -= 1
-                        if depth == 0: end = i; break
+                        if depth == 0:
+                            end = i
+                            break
                 task_data = json.loads(raw[start:end+1])
                 notion_url = await create_notion_task(task_data)
                 if notion_url:
@@ -989,7 +1028,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             )
             try:
                 resp = anthropic_client.messages.create(
-                    model="claude-haiku-4-5",
+                    model=CLAUDE_MODEL,
                     max_tokens=200,
                     messages=[{"role": "user", "content": extract_prompt}]
                 )
@@ -1000,10 +1039,13 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
                 start = raw.find("{")
                 depth, end = 0, start
                 for i, ch in enumerate(raw[start:], start):
-                    if ch == "{": depth += 1
+                    if ch == "{":
+                        depth += 1
                     elif ch == "}":
                         depth -= 1
-                        if depth == 0: end = i; break
+                        if depth == 0:
+                            end = i
+                            break
                 ev = json.loads(raw[start:end+1])
                 h, m = map(int, ev.get("time", "12:00").split(":"))
                 d = datetime.strptime(ev["date"], "%Y-%m-%d").replace(
@@ -1042,7 +1084,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             summary_prompt = "Сделай краткое резюме этого диалога на русском. 3-5 предложений, только суть:\n\n" + "\n".join(lines)
             try:
                 resp = anthropic_client.messages.create(
-                    model="claude-haiku-4-5",
+                    model=CLAUDE_MODEL,
                     max_tokens=300,
                     messages=[{"role": "user", "content": summary_prompt}]
                 )
@@ -1071,7 +1113,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
             )
             try:
                 resp = anthropic_client.messages.create(
-                    model="claude-haiku-4-5",
+                    model=CLAUDE_MODEL,
                     max_tokens=250,
                     messages=[{"role": "user", "content": draft_prompt}]
                 )
@@ -1127,7 +1169,7 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
         # ── Проверяем на напоминание ──────────────────────────────────────────
         reminder = parse_reminder(user_text)
         if reminder:
-            confirmation = add_reminder(chat_id, user_text, reminder["delta_minutes"])
+            confirmation = add_reminder(chat_id, reminder["message"], reminder["delta_minutes"])
             await send(confirmation)
             return
 
@@ -1154,35 +1196,18 @@ async def handle_business_message(update: Update, context: ContextTypes.DEFAULT_
     user_id = msg.from_user.id if msg.from_user else None
     username = msg.from_user.username if msg.from_user else None
 
-    # ── Rate limiting ──────────────────────────────────────────────────────────
-    if is_rate_limited(chat_id):
-        logger.warning(f"Rate limit hit for chat {chat_id} ({user_name})")
-        await context.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text=f"⚠️ Флуд-атака: {user_name} (chat {chat_id}) превысил лимит сообщений."
-        )
-        return
-
-    # ── Prompt injection / data extraction detection ───────────────────────────
-    if detect_injection(user_text):
-        logger.warning(f"Injection attempt from {user_name} ({chat_id}): {user_text[:100]}")
-        await context.bot.send_message(
-            chat_id=OWNER_CHAT_ID,
-            text=f"🚨 Подозрительное сообщение от {user_name} (@{username or 'нет'}):\n\n{user_text[:300]}"
-        )
-        await send("Я могу помочь только с деловыми вопросами. Чем могу быть полезен?")
-        return
-
     # ── Block bot commands from clients ───────────────────────────────────────
     if user_text.strip().startswith("/") and not user_text.strip().startswith("/start"):
         logger.info(f"Client tried command: {user_text[:50]} from {user_name}")
         await send("Чем могу помочь?")
         return
 
-    # ── Sanitize input ─────────────────────────────────────────────────────────
-    user_text = sanitize_input(user_text)
+    # ── Rate limit + injection detection + sanitize (shared gate) ─────────────
+    safe_text = await security_gate(chat_id, user_text, user_name, username, send, context)
+    if safe_text is None:
+        return
 
-    await process_message(chat_id, user_text, user_name, send, context, business_connection_id=business_connection_id, user_id=user_id, username=username)
+    await process_message(chat_id, safe_text, user_name, send, context, business_connection_id=business_connection_id, user_id=user_id, username=username)
 
 async def handle_business_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle new Business connection"""
@@ -1213,7 +1238,26 @@ async def show_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update, context):
     logger.error(f"Error: {context.error}")
 
+def validate_config():
+    """Fail fast with a clear message if required secrets are missing."""
+    missing = []
+    if not TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY")
+    if missing:
+        raise SystemExit(
+            "❌ Не заданы обязательные переменные окружения: "
+            + ", ".join(missing)
+            + ".\nСоздайте файл .env (см. .env.example) и заполните их."
+        )
+    if not OWNER_CHAT_ID:
+        logger.warning("OWNER_CHAT_ID не задан — команды Руслана и уведомления работать не будут.")
+
+ALLOWED_UPDATES = ["message", "business_connection", "business_message", "edited_business_message"]
+
 def main():
+    validate_config()
     logger.info("🚀 Starting Secretary Bot (Business Mode)...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -1229,16 +1273,36 @@ def main():
     app.add_handler(MessageHandler(filters.ALL & filters.UpdateType.BUSINESS_MESSAGE, handle_business_message))
     app.add_error_handler(error_handler)
 
-    logger.info("✅ Bot is running with Business Mode support!")
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=88,
-        url_path="/webhook",
-        webhook_url="https://204.168.139.82:88/webhook",
-        cert="/root/secretary-bot/webhook.pem",
-        key="/root/secretary-bot/webhook.key",
-        allowed_updates=["message","business_connection","business_message","edited_business_message"],
-    )
+    mode = os.getenv("BOT_MODE", "polling").lower()
+    if mode == "webhook":
+        # Server deployment: requires a public HTTPS endpoint.
+        webhook_url = os.getenv("WEBHOOK_URL")
+        if not webhook_url:
+            raise SystemExit("❌ BOT_MODE=webhook требует переменную WEBHOOK_URL.")
+        port = int(os.getenv("WEBHOOK_PORT", "8443"))
+        secret_token = os.getenv("WEBHOOK_SECRET_TOKEN")  # validates X-Telegram-Bot-Api-Secret-Token
+        if not secret_token:
+            logger.warning("WEBHOOK_SECRET_TOKEN не задан — рекомендуется установить для защиты вебхука.")
+        kwargs = dict(
+            listen=os.getenv("WEBHOOK_LISTEN", "0.0.0.0"),
+            port=port,
+            url_path=os.getenv("WEBHOOK_PATH", "/webhook"),
+            webhook_url=webhook_url,
+            allowed_updates=ALLOWED_UPDATES,
+        )
+        if secret_token:
+            kwargs["secret_token"] = secret_token
+        cert = os.getenv("WEBHOOK_CERT")
+        key = os.getenv("WEBHOOK_KEY")
+        if cert and key:
+            kwargs["cert"] = cert
+            kwargs["key"] = key
+        logger.info(f"✅ Bot is running in WEBHOOK mode on port {port}!")
+        app.run_webhook(**kwargs)
+    else:
+        # Default: long polling — works on any machine, no public IP needed.
+        logger.info("✅ Bot is running in POLLING mode!")
+        app.run_polling(allowed_updates=ALLOWED_UPDATES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
